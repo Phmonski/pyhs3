@@ -7,6 +7,7 @@ Test the HistFactoryDist class with various modifiers and configurations.
 from __future__ import annotations
 
 import json
+import math
 import platform
 import warnings
 
@@ -14,6 +15,7 @@ import numpy as np
 import pytensor.tensor as pt
 import pytest
 from pytensor import function
+from pytensor.graph.traversal import explicit_graph_inputs
 
 try:
     import pyhf
@@ -778,6 +780,202 @@ class TestPyhfPrecisionValidation:
 
         # With constraint, moving away from nominal should reduce likelihood
         assert result_nominal > result_varied  # Higher log prob at nominal
+
+    def test_constraint_terms_are_deduplicated_within_channel(self):
+        """Shared nuisance parameters contribute one constraint per channel."""
+
+        axes = [{"name": "x", "min": 0.0, "max": 1.0, "nbins": 1}]
+        samples = [
+            {
+                "name": "background_1",
+                "data": {"contents": [10.0], "errors": [1.0]},
+                "modifiers": [
+                    {
+                        "name": "shared_norm",
+                        "type": "normsys",
+                        "parameter": "alpha_shared",
+                        "constraint": "Gauss",
+                        "data": {"hi": 1.1, "lo": 0.9},
+                    }
+                ],
+            },
+            {
+                "name": "background_2",
+                "data": {"contents": [20.0], "errors": [1.0]},
+                "modifiers": [
+                    {
+                        "name": "shared_norm",
+                        "type": "normsys",
+                        "parameter": "alpha_shared",
+                        "constraint": "Gauss",
+                        "data": {"hi": 1.2, "lo": 0.8},
+                    }
+                ],
+            },
+        ]
+
+        dist = HistFactoryDistChannel(name="singlechannel", axes=axes, samples=samples)
+        alpha_shared = pt.dscalar("alpha_shared")
+        context = Context(
+            {
+                "alpha_shared": alpha_shared,
+                "singlechannel_observed": pt.dvector("singlechannel_observed"),
+            }
+        )
+
+        expr = dist.extended_likelihood(context)
+        f = function([alpha_shared], expr)
+
+        expected_once = math.exp(-0.5) / math.sqrt(2.0 * math.pi)
+        assert float(f(1.0)) == pytest.approx(expected_once)
+
+    def test_conflicting_duplicate_constraints_raise(self):
+        """The same constraint key cannot have incompatible definitions."""
+
+        axes = [{"name": "x", "min": 0.0, "max": 1.0, "nbins": 1}]
+        samples = [
+            {
+                "name": "background_1",
+                "data": {"contents": [10.0], "errors": [1.0]},
+                "modifiers": [
+                    {
+                        "name": "shared_norm",
+                        "type": "normsys",
+                        "parameter": "alpha_shared",
+                        "constraint": "Gauss",
+                        "data": {"hi": 1.1, "lo": 0.9},
+                    }
+                ],
+            },
+            {
+                "name": "background_2",
+                "data": {"contents": [20.0], "errors": [1.0]},
+                "modifiers": [
+                    {
+                        "name": "shared_norm",
+                        "type": "normsys",
+                        "parameter": "alpha_shared",
+                        "constraint": "Poisson",
+                        "data": {"hi": 1.2, "lo": 0.8},
+                    }
+                ],
+            },
+        ]
+
+        dist = HistFactoryDistChannel(name="singlechannel", axes=axes, samples=samples)
+        alpha_shared = pt.dscalar("alpha_shared")
+        context = Context(
+            {
+                "alpha_shared": alpha_shared,
+                "singlechannel_observed": pt.dvector("singlechannel_observed"),
+            }
+        )
+
+        with pytest.raises(ValueError, match="Conflicting HistFactory constraint"):
+            dist.extended_likelihood(context)
+
+    def test_constraint_terms_are_deduplicated_across_channels_in_log_prob(self):
+        """Combined HistFactory likelihoods share a single nuisance constraint."""
+
+        ws = pyhs3.Workspace(
+            **{
+                "metadata": {"hs3_version": "0.2"},
+                "distributions": [
+                    {
+                        "name": "channel_1",
+                        "type": "histfactory_dist",
+                        "axes": [{"name": "x1", "min": 0.0, "max": 1.0, "nbins": 1}],
+                        "samples": [
+                            {
+                                "name": "background",
+                                "data": {"contents": [10.0], "errors": [1.0]},
+                                "modifiers": [
+                                    {
+                                        "name": "shared_norm",
+                                        "type": "normsys",
+                                        "parameter": "alpha_shared",
+                                        "constraint": "Gauss",
+                                        "data": {"hi": 1.1, "lo": 0.9},
+                                    }
+                                ],
+                            }
+                        ],
+                    },
+                    {
+                        "name": "channel_2",
+                        "type": "histfactory_dist",
+                        "axes": [{"name": "x2", "min": 0.0, "max": 1.0, "nbins": 1}],
+                        "samples": [
+                            {
+                                "name": "background",
+                                "data": {"contents": [20.0], "errors": [1.0]},
+                                "modifiers": [
+                                    {
+                                        "name": "shared_norm",
+                                        "type": "normsys",
+                                        "parameter": "alpha_shared",
+                                        "constraint": "Gauss",
+                                        "data": {"hi": 1.1, "lo": 0.9},
+                                    }
+                                ],
+                            }
+                        ],
+                    },
+                ],
+                "data": [
+                    {
+                        "name": "data_1",
+                        "type": "binned",
+                        "axes": [{"name": "x1", "min": 0.0, "max": 1.0, "nbins": 1}],
+                        "contents": [11.0],
+                    },
+                    {
+                        "name": "data_2",
+                        "type": "binned",
+                        "axes": [{"name": "x2", "min": 0.0, "max": 1.0, "nbins": 1}],
+                        "contents": [22.0],
+                    },
+                ],
+                "likelihoods": [
+                    {
+                        "name": "combined",
+                        "distributions": ["channel_1", "channel_2"],
+                        "data": ["data_1", "data_2"],
+                    }
+                ],
+                "domains": [
+                    {
+                        "name": "default",
+                        "type": "product_domain",
+                        "axes": [{"name": "alpha_shared", "min": -5.0, "max": 5.0}],
+                    }
+                ],
+            }
+        )
+        model = ws.model(ws.likelihoods["combined"], progress=False)
+        log_prob = model.log_prob
+        inputs = {
+            v.name: v
+            for v in explicit_graph_inputs([log_prob])
+            if v.name is not None
+        }
+        f = function(list(inputs.values()), log_prob)
+        values = {
+            **model.data,
+            "alpha_shared": np.array(1.0),
+        }
+        result = float(f(*[values[name] for name in inputs]))
+
+        def poisson_logpmf(k, mu):
+            return k * math.log(mu) - mu - math.lgamma(k + 1.0)
+
+        expected = (
+            poisson_logpmf(11.0, 11.0)
+            + poisson_logpmf(22.0, 22.0)
+            - 0.5
+            - 0.5 * math.log(2.0 * math.pi)
+        )
+        assert result == pytest.approx(expected)
 
     def test_multiple_samples_expression(self):
         """Test HistFactory with multiple samples."""

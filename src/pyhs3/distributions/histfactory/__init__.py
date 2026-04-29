@@ -19,7 +19,11 @@ from pyhs3.context import Context
 
 # Import existing distributions for constraint terms
 from pyhs3.distributions.core import Distribution
-from pyhs3.distributions.histfactory.modifiers import HasConstraint, Modifier
+from pyhs3.distributions.histfactory.modifiers import (
+    ConstraintTerm,
+    HasConstraint,
+    Modifier,
+)
 from pyhs3.distributions.histfactory.samples import Sample, Samples
 from pyhs3.networks import HasDependencies, HasInternalNodes
 from pyhs3.typing.aliases import TensorVar
@@ -181,20 +185,40 @@ class HistFactoryDistChannel(Distribution, HasInternalNodes):
         Returns:
             PyTensor expression for the constraint likelihood terms
         """
-        constraint_probs = []
-
-        # Collect all constraint terms from modifiers
-        for sample in self.samples:
-            for modifier in sample.modifiers:
-                if isinstance(modifier, HasConstraint):
-                    prob = modifier.make_constraint(context, sample.data)
-                    constraint_probs.append(prob)
+        constraint_probs = [
+            term.value for term in self.constraint_terms(context).values()
+        ]
 
         if not constraint_probs:
             return pt.constant(1.0)
 
         # Multiply all constraint probabilities
         return cast(TensorVar, pt.prod(pt.stack(constraint_probs)))  # type: ignore[no-untyped-call]
+
+    def constraint_terms(self, context: Context) -> dict[str, ConstraintTerm]:
+        """Return unique constraint terms keyed by their global constraint identity."""
+        terms: dict[str, ConstraintTerm] = {}
+
+        for sample in self.samples:
+            for modifier in sample.modifiers:
+                if not isinstance(modifier, HasConstraint):
+                    continue
+
+                for term in modifier.constraint_terms(context, sample.data):
+                    existing = terms.get(term.key)
+                    if existing is None:
+                        terms[term.key] = term
+                        continue
+
+                    if existing.signature != term.signature:
+                        msg = (
+                            f"Conflicting HistFactory constraint '{term.key}' in "
+                            f"distribution '{self.name}': {existing.signature!r} "
+                            f"!= {term.signature!r}"
+                        )
+                        raise ValueError(msg)
+
+        return terms
 
     def _get_total_bins(self) -> int:
         """Calculate total number of bins across all axes."""

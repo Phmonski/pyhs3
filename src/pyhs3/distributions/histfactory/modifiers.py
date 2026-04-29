@@ -2,7 +2,8 @@ from __future__ import annotations
 
 from abc import ABC, abstractmethod
 from collections.abc import Iterator
-from typing import Annotated, Any, Literal, cast
+from dataclasses import dataclass
+from typing import Annotated, Any, Hashable, Literal, cast
 
 import pytensor.tensor as pt
 from pydantic import (
@@ -24,6 +25,15 @@ from pyhs3.distributions.histfactory.data import SampleData
 from pyhs3.exceptions import custom_error_msg
 from pyhs3.networks import HasDependencies
 from pyhs3.typing.aliases import TensorVar
+
+
+@dataclass(frozen=True)
+class ConstraintTerm:
+    """A uniquely identifiable HistFactory constraint contribution."""
+
+    key: str
+    signature: Hashable
+    value: TensorVar
 
 
 class ModifierData(BaseModel):
@@ -103,11 +113,30 @@ class Modifier(BaseModel, HasDependencies, ABC):
 class HasConstraint(ABC):
     """Base class for modifiers that can have constraint terms."""
 
-    constraint: Literal["Gauss", "Poisson", "LogNormal"] | None
+    constraint: Literal["Gauss", "Poisson", "LogNormal", "Lognormal"] | None
+    constraint_name: str | None
+    constraint_type: Literal["Gauss", "Poisson", "LogNormal", "Lognormal"] | None
 
     @abstractmethod
     def make_constraint(self, context: Context, sample_data: SampleData) -> TensorVar:
         """Create constraint term for this modifier."""
+
+    @abstractmethod
+    def constraint_terms(
+        self, context: Context, sample_data: SampleData
+    ) -> list[ConstraintTerm]:
+        """Create identifiable constraint terms for this modifier."""
+
+
+def _effective_constraint(modifier: HasConstraint) -> str:
+    constraint = modifier.constraint_type or modifier.constraint or "Gauss"
+    return "LogNormal" if constraint == "Lognormal" else constraint
+
+
+def _single_parameter_constraint_key(
+    modifier: HasConstraint, parameter: str
+) -> str:
+    return modifier.constraint_name or f"{parameter}Constraint"
 
 
 # Parameterized modifier base (single parameter)
@@ -183,7 +212,11 @@ class NormSysModifier(HasConstraint, ParameterModifier):
 
     type: Literal["normsys"] = "normsys"
     application: Literal["multiplicative"] = Field("multiplicative", exclude=True)
-    constraint: Literal["Gauss", "Poisson", "LogNormal"] = "Gauss"
+    constraint: Literal["Gauss", "Poisson", "LogNormal", "Lognormal"] | None = "Gauss"
+    constraint_name: str | None = None
+    constraint_type: Literal["Gauss", "Poisson", "LogNormal", "Lognormal"] | None = (
+        None
+    )
     data: NormSysData
     _nominal_factor: TensorVar = PrivateAttr()
     _hi_factor_tensor: TensorVar = PrivateAttr()
@@ -240,12 +273,14 @@ class NormSysModifier(HasConstraint, ParameterModifier):
         name = f"constraint_{self.name}"
         constraint_dist: Distribution
 
-        if self.constraint == "Gauss":
+        constraint = _effective_constraint(self)
+
+        if constraint == "Gauss":
             # Gaussian constraint: Normal(auxdata | mean=parameter, std=sigma)
             constraint_dist = GaussianDist(
                 name=name, x=0.0, mean=self.parameter, sigma=1.0
             )
-        elif self.constraint == "Poisson":
+        elif constraint == "Poisson":
             constraint_dist = PoissonDist(name=name, x=1.0, mean=self.parameter)
         else:  # self.constraint == "LogNormal"
             # LogNormal constraint: log(param) ~ N(0, 1)
@@ -257,13 +292,30 @@ class NormSysModifier(HasConstraint, ParameterModifier):
         augmented_context = {**context, **constraint_dist.constants}
         return constraint_dist.expression(Context(augmented_context))
 
+    def constraint_terms(
+        self, context: Context, sample_data: SampleData
+    ) -> list[ConstraintTerm]:
+        """Create a single constraint term keyed by the nuisance parameter."""
+        constraint = _effective_constraint(self)
+        return [
+            ConstraintTerm(
+                key=_single_parameter_constraint_key(self, self.parameter),
+                signature=(constraint, self.parameter, 0.0, 1.0),
+                value=self.make_constraint(context, sample_data),
+            )
+        ]
+
 
 class HistoSysModifier(HasConstraint, ParameterModifier):
     """Additive correlated shape systematic modifier."""
 
     type: Literal["histosys"] = "histosys"
     application: Literal["additive"] = Field("additive", exclude=True)
-    constraint: Literal["Gauss", "Poisson", "LogNormal"] = "Gauss"
+    constraint: Literal["Gauss", "Poisson", "LogNormal", "Lognormal"] | None = "Gauss"
+    constraint_name: str | None = None
+    constraint_type: Literal["Gauss", "Poisson", "LogNormal", "Lognormal"] | None = (
+        None
+    )
     data: HistoSysData
 
     @property
@@ -310,12 +362,14 @@ class HistoSysModifier(HasConstraint, ParameterModifier):
         name = f"constraint_{self.name}"
         constraint_dist: Distribution
 
-        if self.constraint == "Gauss":
+        constraint = _effective_constraint(self)
+
+        if constraint == "Gauss":
             # Gaussian constraint: Normal(auxdata | mean=parameter, std=sigma)
             constraint_dist = GaussianDist(
                 name=name, x=0.0, mean=self.parameter, sigma=1.0
             )
-        elif self.constraint == "Poisson":
+        elif constraint == "Poisson":
             constraint_dist = PoissonDist(name=name, x=1.0, mean=self.parameter)
         else:  # self.constraint == "LogNormal"
             constraint_dist = LogNormalDist(
@@ -325,6 +379,19 @@ class HistoSysModifier(HasConstraint, ParameterModifier):
         # Use the distribution's constants to augment the context
         augmented_context = {**context, **constraint_dist.constants}
         return constraint_dist.expression(Context(augmented_context))
+
+    def constraint_terms(
+        self, context: Context, sample_data: SampleData
+    ) -> list[ConstraintTerm]:
+        """Create a single constraint term keyed by the nuisance parameter."""
+        constraint = _effective_constraint(self)
+        return [
+            ConstraintTerm(
+                key=_single_parameter_constraint_key(self, self.parameter),
+                signature=(constraint, self.parameter, 0.0, 1.0),
+                value=self.make_constraint(context, sample_data),
+            )
+        ]
 
 
 class ShapeFactorModifier(ParametersModifier):
@@ -358,7 +425,9 @@ class ShapeSysModifier(HasConstraint, ParametersModifier):
 
     type: Literal["shapesys"] = "shapesys"
     application: Literal["multiplicative"] = Field("multiplicative", exclude=True)
-    constraint: Literal["Poisson"] = "Poisson"
+    constraint: Literal["Poisson"] | None = "Poisson"
+    constraint_name: str | None = None
+    constraint_type: Literal["Poisson"] | None = None
     data: ShapeSysData
 
     @property
@@ -418,6 +487,46 @@ class ShapeSysModifier(HasConstraint, ParametersModifier):
 
         return cast(TensorVar, pt.prod(pt.stack(factors), axis=0))  # type: ignore[no-untyped-call]
 
+    def constraint_terms(
+        self, context: Context, sample_data: SampleData
+    ) -> list[ConstraintTerm]:
+        """Create one identifiable constraint term per gamma parameter."""
+
+        nominal_yield = pt.vector("nominal_yield")
+        uncertainty = pt.vector("uncertainty")
+        rate_fn = function(
+            [nominal_yield, uncertainty], (nominal_yield / uncertainty) ** 2
+        )
+        rates = rate_fn(sample_data.contents, self.data.vals)
+
+        augmented_context = dict(context)
+        terms = []
+        constraint = _effective_constraint(self)
+
+        for parameter, rate in zip(self.parameters, rates, strict=False):
+            scaled_param_name = f"{parameter}_scaled"
+            augmented_context[scaled_param_name] = context[parameter] * rate
+            dist = PoissonDist(
+                name=f"constraint_{self.name}_{parameter}",
+                x=rate,
+                mean=scaled_param_name,
+            )
+            dist_augmented_context = {**augmented_context, **dist.constants}
+            value = dist.expression(Context(dist_augmented_context))
+            terms.append(
+                ConstraintTerm(
+                    key=(
+                        _single_parameter_constraint_key(self, parameter)
+                        if len(self.parameters) == 1
+                        else f"{parameter}Constraint"
+                    ),
+                    signature=(constraint, parameter, float(rate)),
+                    value=value,
+                )
+            )
+
+        return terms
+
 
 class StatErrorModifier(HasConstraint, ParametersModifier):
     """Statistical uncertainty modifier (Barlow-Beeston method)."""
@@ -425,7 +534,9 @@ class StatErrorModifier(HasConstraint, ParametersModifier):
     type: Literal["staterror"] = "staterror"
     application: Literal["multiplicative"] = Field("multiplicative", exclude=True)
     parameters: list[str]
-    constraint: Literal["Gauss"] = "Gauss"
+    constraint: Literal["Gauss"] | None = "Gauss"
+    constraint_name: str | None = None
+    constraint_type: Literal["Gauss"] | None = None
     data: StatErrorData
 
     @property
@@ -489,6 +600,44 @@ class StatErrorModifier(HasConstraint, ParametersModifier):
             factors.append(dist.expression(augmented_ctx))
 
         return cast(TensorVar, pt.prod(pt.stack(factors), axis=0))  # type: ignore[no-untyped-call]
+
+    def constraint_terms(
+        self, context: Context, sample_data: SampleData
+    ) -> list[ConstraintTerm]:
+        """Create one identifiable constraint term per staterror gamma parameter."""
+
+        augmented_context = dict(context)
+        terms = []
+        constraint = _effective_constraint(self)
+
+        for i, (parameter, uncertainty) in enumerate(
+            zip(self.parameters, self.data.uncertainties, strict=False)
+        ):
+            nominal_yield = sample_data.contents[i]
+            sigma_value = uncertainty / nominal_yield if nominal_yield > 0 else 1.0
+            sigma_param_name = f"{parameter}_sigma"
+            augmented_context[sigma_param_name] = pt.constant(sigma_value)
+            dist = GaussianDist(
+                name=f"constraint_{self.name}_{parameter}",
+                x=1.0,
+                mean=parameter,
+                sigma=sigma_param_name,
+            )
+            dist_augmented_context = {**augmented_context, **dist.constants}
+            value = dist.expression(Context(dist_augmented_context))
+            terms.append(
+                ConstraintTerm(
+                    key=(
+                        _single_parameter_constraint_key(self, parameter)
+                        if len(self.parameters) == 1
+                        else f"{parameter}Constraint"
+                    ),
+                    signature=(constraint, parameter, float(sigma_value)),
+                    value=value,
+                )
+            )
+
+        return terms
 
 
 # Discriminated union of all modifier types.

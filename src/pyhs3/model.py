@@ -23,6 +23,9 @@ from rich.progress import (
 
 from pyhs3.context import Context
 from pyhs3.distributions import Distributions
+from pyhs3.distributions.core import Distribution
+from pyhs3.distributions.histfactory import HistFactoryDistChannel
+from pyhs3.distributions.histfactory.modifiers import ConstraintTerm
 from pyhs3.domains import Domain
 from pyhs3.functions import Functions
 from pyhs3.networks import build_dependency_graph
@@ -128,7 +131,20 @@ class Model:
         if self._likelihood is None:
             msg = "data requires a likelihood context; build via ws.model(analysis)"
             raise RuntimeError(msg)
-        return self._likelihood.data_arrays()
+        result = self._likelihood.data_arrays()
+        for dist_obj, datum in zip(
+            self._likelihood.distributions, self._likelihood.data, strict=True
+        ):
+            if isinstance(datum, str):
+                continue
+            dist = self._resolve_likelihood_distribution(dist_obj)
+            if isinstance(dist, HistFactoryDistChannel):
+                contents = getattr(datum, "contents", None)
+                if contents is not None:
+                    result[f"{dist.name}_observed"] = np.asarray(
+                        contents, dtype=np.float64
+                    )
+        return result
 
     @property
     def nominal_params(self) -> dict[str, float]:
@@ -199,17 +215,45 @@ class Model:
             raise RuntimeError(msg)
 
         lp_terms: list[TensorVar] = []
+        histfactory_constraints: dict[str, ConstraintTerm] = {}
+        context = Context(
+            parameters={
+                **self.parameters,
+                **self.functions,
+                **self.distributions,
+                **self.modifiers,
+            },
+            observables=self._observables,
+        )
 
         for dist_obj, datum in zip(
             self._likelihood.distributions, self._likelihood.data, strict=True
         ):
             if isinstance(datum, str):
                 continue
+
+            dist = self._resolve_likelihood_distribution(dist_obj)
+            if isinstance(dist, HistFactoryDistChannel):
+                lp_terms.append(pt.log(dist.likelihood(context)))
+                for key, term in dist.constraint_terms(context).items():
+                    existing = histfactory_constraints.get(key)
+                    if existing is None:
+                        histfactory_constraints[key] = term
+                        continue
+                    if existing.signature != term.signature:
+                        msg = (
+                            f"Conflicting HistFactory constraint '{key}' in "
+                            f"likelihood '{self._likelihood.name}': "
+                            f"{existing.signature!r} != {term.signature!r}"
+                        )
+                        raise ValueError(msg)
+                continue
+
             entries = getattr(datum, "entries", None)
             if entries is None:
                 continue
 
-            dist_name = dist_obj if isinstance(dist_obj, str) else dist_obj.name
+            dist_name = dist.name
 
             # model.distributions[name] is the normalized PDF expression with
             # observables as symbolic pt.vector free inputs.
@@ -234,9 +278,20 @@ class Model:
                 if aux_name in self.distributions:
                     lp_terms.append(pt.log(self.distributions[aux_name]))
 
+        for term in histfactory_constraints.values():
+            lp_terms.append(pt.log(term.value))
+
         if lp_terms:
             return pt.sum(pt.stack(lp_terms))  # type: ignore[no-untyped-call,no-any-return]
         return pt.constant(np.float64(0.0))
+
+    def _resolve_likelihood_distribution(
+        self, dist_obj: str | Distribution
+    ) -> Distribution:
+        """Resolve a likelihood distribution reference to its distribution object."""
+        if isinstance(dist_obj, str):
+            return self._distribution_objects[dist_obj]
+        return dist_obj
 
     @staticmethod
     def _ensure_array(
