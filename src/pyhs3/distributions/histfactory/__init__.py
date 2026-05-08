@@ -198,17 +198,11 @@ class HistFactoryDistChannel(Distribution, HasInternalNodes):
         """
         constraint_probs = []
 
-        # Collect all constraint terms from modifiers
-        for sample in self.samples:
-            for modifier in sample.modifiers:
-                if isinstance(modifier, HasConstraint):
-                    # Skip StatErrorModifier in lite mode - constraint built at channel level
-                    if self.barlow_beeston_method == "lite" and isinstance(
-                        modifier, StatErrorModifier
-                    ):
-                        continue
-                    prob = modifier.make_constraint(context, sample.data)
-                    constraint_probs.append(prob)
+        single_constraints, multi_constraints = self.constraint_modifiers()
+        for modifier, sample_data in single_constraints.values():
+            constraint_probs.append(modifier.make_constraint(context, sample_data))
+        for modifier, sample_data in multi_constraints:
+            constraint_probs.append(modifier.make_constraint(context, sample_data))
 
         # Add channel-level BB-lite constraint if in lite mode
         if self.barlow_beeston_method == "lite":
@@ -243,6 +237,10 @@ class HistFactoryDistChannel(Distribution, HasInternalNodes):
         for sample in self.samples:
             for modifier in sample.modifiers:
                 if not isinstance(modifier, HasConstraint):
+                    continue
+                if self.barlow_beeston_method == "lite" and isinstance(
+                    modifier, StatErrorModifier
+                ):
                     continue
                 if isinstance(modifier, ParameterModifier):
                     single.setdefault(modifier.parameter, (modifier, sample.data))

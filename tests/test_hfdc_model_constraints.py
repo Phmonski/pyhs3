@@ -352,6 +352,95 @@ class TestHFDCLogProb:
         expected = poisson_lp + gauss_lp
         assert abs(val - expected) < 1e-6, f"got {val}, expected {expected}"
 
+    def test_log_prob_bblite_staterror_uses_channel_constraint(self):
+        """BB-lite staterror constraints are channel-level in Model.log_prob."""
+        ws = Workspace(
+            metadata=Metadata(hs3_version="0.3.0"),
+            distributions=Distributions(
+                [
+                    HistFactoryDistChannel(
+                        name="SR",
+                        axes=[{"name": "x", "min": 0.0, "max": 1.0, "nbins": 1}],
+                        samples=[
+                            {
+                                "name": "s1",
+                                "data": {"contents": [10.0], "errors": [3.0]},
+                                "modifiers": [
+                                    {
+                                        "name": "stat",
+                                        "type": "staterror",
+                                        "parameters": ["gamma"],
+                                        "constraint": "Gauss",
+                                    }
+                                ],
+                            },
+                            {
+                                "name": "s2",
+                                "data": {"contents": [20.0], "errors": [4.0]},
+                                "modifiers": [
+                                    {
+                                        "name": "stat",
+                                        "type": "staterror",
+                                        "parameters": ["gamma"],
+                                        "constraint": "Gauss",
+                                    }
+                                ],
+                            },
+                        ],
+                    )
+                ]
+            ),
+            data=Data(
+                [
+                    BinnedData(
+                        name="obs",
+                        axes=[{"name": "x", "min": 0.0, "max": 1.0, "nbins": 1}],
+                        contents=[30.0],
+                    )
+                ]
+            ),
+            likelihoods=Likelihoods(
+                [Likelihood(name="L", distributions=["SR"], data=["obs"])]
+            ),
+            domains=Domains(
+                [
+                    ProductDomain(
+                        name="default",
+                        axes=[{"name": "gamma", "min": 0.0, "max": 5.0}],
+                    )
+                ]
+            ),
+            parameter_points=ParameterPoints(
+                [
+                    ParameterSet(
+                        name="default",
+                        parameters=[ParameterPoint(name="gamma", value=1.0)],
+                    )
+                ]
+            ),
+        )
+
+        model = ws.model(
+            ws.likelihoods["L"],
+            parameter_set=ws.parameter_points["default"],
+            domain=ws.domains["default"],
+            progress=False,
+        )
+        lp = model.log_prob
+        inputs = {
+            v.name: v
+            for v in pytensor.graph.traversal.explicit_graph_inputs([lp])
+            if v.name
+        }
+        fn = pytensor.function(list(inputs.values()), lp)
+        val = float(fn(**model.data, **model.nominal_params).item())
+
+        poisson_lp = 30.0 * math.log(30.0) - 30.0 - math.lgamma(31.0)
+        relerr = 5.0 / 30.0
+        gauss_lp = -0.5 * math.log(2 * math.pi) - math.log(relerr)
+        expected = poisson_lp + gauss_lp
+        assert abs(val - expected) < 1e-6, f"got {val}, expected {expected}"
+
 
 # ---------------------------------------------------------------------------
 # Integration tests: constraint deduplication across channels
@@ -398,6 +487,101 @@ class TestConstraintDeduplication:
         gauss_lp = -0.5 * math.log(2 * math.pi)
         expected = poisson_sr + poisson_cr + gauss_lp
         assert abs(val - expected) < 1e-6, f"got {val}, expected {expected}"
+
+    def test_direct_pdf_dedups_shared_normsys_within_channel(self):
+        """Direct HFDC pdf keeps one constraint for a shared same-channel nuisance."""
+        ws = Workspace(
+            metadata=Metadata(hs3_version="0.3.0"),
+            distributions=Distributions(
+                [
+                    HistFactoryDistChannel(
+                        name="model",
+                        axes=[
+                            {"name": "obs_x", "min": 0.0, "max": 1.0, "nbins": 1}
+                        ],
+                        samples=[
+                            {
+                                "name": "s1",
+                                "data": {"contents": [50.0], "errors": [0.0]},
+                                "modifiers": [
+                                    {
+                                        "name": "lumi",
+                                        "parameter": "alpha_lumi",
+                                        "type": "normsys",
+                                        "data": {"hi": 1.0, "lo": 1.0},
+                                        "constraint": "Gauss",
+                                    }
+                                ],
+                            },
+                            {
+                                "name": "s2",
+                                "data": {"contents": [50.0], "errors": [0.0]},
+                                "modifiers": [
+                                    {
+                                        "name": "lumi",
+                                        "parameter": "alpha_lumi",
+                                        "type": "normsys",
+                                        "data": {"hi": 1.0, "lo": 1.0},
+                                        "constraint": "Gauss",
+                                    }
+                                ],
+                            },
+                        ],
+                    )
+                ]
+            ),
+            data=Data(
+                [
+                    BinnedData(
+                        name="obsData",
+                        axes=[
+                            {"name": "obs_x", "min": 0.0, "max": 1.0, "nbins": 1}
+                        ],
+                        contents=[100.0],
+                    )
+                ]
+            ),
+            likelihoods=Likelihoods(
+                [Likelihood(name="L", distributions=["model"], data=["obsData"])]
+            ),
+            domains=Domains(
+                [
+                    ProductDomain(
+                        name="default",
+                        axes=[{"name": "alpha_lumi", "min": -5.0, "max": 5.0}],
+                    )
+                ]
+            ),
+            parameter_points=ParameterPoints(
+                [
+                    ParameterSet(
+                        name="default",
+                        parameters=[ParameterPoint(name="alpha_lumi", value=0.0)],
+                    )
+                ]
+            ),
+        )
+        model = ws.model(
+            ws.likelihoods["L"],
+            parameter_set=ws.parameter_points["default"],
+            domain=ws.domains["default"],
+            progress=False,
+        )
+
+        eps = 0.5
+        obs = np.array([100.0])
+        nll = {
+            alpha: -float(
+                np.log(
+                    model.pdf_unsafe(
+                        "model", alpha_lumi=alpha, model_observed=obs
+                    )
+                )
+            )
+            for alpha in (-eps, 0.0, eps)
+        }
+        curvature = (nll[eps] + nll[-eps] - 2 * nll[0.0]) / (eps * eps)
+        assert abs(curvature - 1.0) < 1e-6
 
     def test_two_channels_independent_normsys_both_constraints_present(self):
         """Two channels with different normsys parameters must each contribute a constraint."""

@@ -435,6 +435,10 @@ class Model:
             self._hfdc_constraints.append(
                 modifier.make_constraint(context, sample_data)
             )
+        if dist.barlow_beeston_method == "lite":
+            lite_constraint = dist._make_barlow_beeston_lite_constraint(context)
+            if lite_constraint is not None:
+                self._hfdc_constraints.append(lite_constraint)
 
         return dist.expression(context)
 
