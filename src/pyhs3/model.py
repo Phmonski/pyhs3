@@ -9,7 +9,13 @@ from typing import TYPE_CHECKING, Any, Literal, cast
 import numpy as np
 import numpy.typing as npt
 import pytensor.tensor as pt
-from pytensor.compile.function import function
+
+try:
+    from pytensor.compile.maker import function  # pytensor >= 3
+except ImportError:
+    from pytensor.compile.function import (  # type: ignore[no-redef]
+        function,  # pytensor < 3
+    )
 from pytensor.graph.traversal import applys_between, explicit_graph_inputs
 from rich.progress import (
     BarColumn,

@@ -7,7 +7,13 @@ import warnings
 import numpy as np
 import pytensor.tensor as pt
 import pytest
-from pytensor.compile.function import function
+
+try:
+    from pytensor.compile.maker import function  # pytensor >= 3
+except ImportError:
+    from pytensor.compile.function import (
+        function,  # type: ignore[no-redef]  # pytensor < 3
+    )
 from pytensor.graph.traversal import explicit_graph_inputs
 
 from pyhs3 import Model, Workspace

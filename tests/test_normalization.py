@@ -12,7 +12,13 @@ from pydantic import (
     ConfigDict,
     Field,
 )
-from pytensor.compile.function import function
+
+try:
+    from pytensor.compile.maker import function  # pytensor >= 3
+except ImportError:
+    from pytensor.compile.function import (
+        function,  # type: ignore[no-redef]  # pytensor < 3
+    )
 
 from pyhs3.axes import RegularAxis
 from pyhs3.context import Context

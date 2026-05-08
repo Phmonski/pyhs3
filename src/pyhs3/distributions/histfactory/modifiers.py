@@ -12,7 +12,13 @@ from pydantic import (
     RootModel,
     model_validator,
 )
-from pytensor.compile.function import function
+
+try:
+    from pytensor.compile.maker import function  # pytensor >= 3
+except ImportError:
+    from pytensor.compile.function import (  # type: ignore[no-redef]
+        function,  # pytensor < 3
+    )
 
 from pyhs3.context import Context
 from pyhs3.distributions.basic import GaussianDist, LogNormalDist, PoissonDist
